@@ -52,8 +52,22 @@ EXIT_TAKE_PROFIT = int(os.environ.get("CIPC_EXIT_TAKE_PROFIT", "35"))
 STOP_LOSS = int(os.environ.get("CIPC_STOP_LOSS", "260"))
 MIN_EQUITY_STOP = float(os.environ.get("CIPC_MIN_EQUITY_STOP", "89500"))
 MAX_LOSS_STOP = float(os.environ.get("CIPC_MAX_LOSS_STOP", "11000"))
+MAX_SPREAD_ENTER = int(os.environ.get("CIPC_MAX_SPREAD_ENTER", "90"))
+MAX_VOLATILITY_ENTER = float(os.environ.get("CIPC_MAX_VOLATILITY_ENTER", "120"))
+AGGRESSION_MODE = os.environ.get("CIPC_AGGRESSION_MODE", "competitivo")
+MOMENTUM_MODE = os.environ.get("CIPC_MOMENTUM_MODE", "auto")
+MOMENTUM_TREND_ENTER = float(os.environ.get("CIPC_MOMENTUM_TREND_ENTER", "6"))
+MOMENTUM_EDGE_DISCOUNT = int(os.environ.get("CIPC_MOMENTUM_EDGE_DISCOUNT", "25"))
+MOMENTUM_PRICE_STEP = int(os.environ.get("CIPC_MOMENTUM_PRICE_STEP", "18"))
+DOWNTREND_EDGE_EXTRA = int(os.environ.get("CIPC_DOWNTREND_EDGE_EXTRA", "45"))
+# Control operativo leido en caliente desde risk_config.json.
+# PAUSE_TRADING debe mantener la conexion privada viva para evitar el
+# cancel-on-disconnect del exchange, pero no debe crear ni reemplazar ordenes.
+PAUSE_TRADING = os.environ.get("CIPC_PAUSE_TRADING", "0") == "1"
+STOP_BOT = os.environ.get("CIPC_STOP_BOT", "0") == "1"
 ALLOW_SHORT = os.environ.get("CIPC_ALLOW_SHORT", "0") == "1"
 ALLOW_BUY_TAKE = os.environ.get("CIPC_ALLOW_BUY_TAKE", "0") == "1"
+BUY_TAKE_MAX_PREMIUM = float(os.environ.get("CIPC_BUY_TAKE_MAX_PREMIUM", "25"))
 FAIR_VALUE_OVERRIDE = os.environ.get("CIPC_FAIR_VALUE")
 RISK_CONFIG_PATH = Path(os.environ.get("CIPC_RISK_CONFIG", "risk_config.json"))
 RISK_CONFIG_MTIME = 0.0
@@ -82,8 +96,19 @@ RISK_KEYS = {
     "STOP_LOSS": int,
     "MIN_EQUITY_STOP": float,
     "MAX_LOSS_STOP": float,
+    "MAX_SPREAD_ENTER": int,
+    "MAX_VOLATILITY_ENTER": float,
+    "AGGRESSION_MODE": str,
+    "MOMENTUM_MODE": str,
+    "MOMENTUM_TREND_ENTER": float,
+    "MOMENTUM_EDGE_DISCOUNT": int,
+    "MOMENTUM_PRICE_STEP": int,
+    "DOWNTREND_EDGE_EXTRA": int,
+    "PAUSE_TRADING": bool,
+    "STOP_BOT": bool,
     "ALLOW_SHORT": bool,
     "ALLOW_BUY_TAKE": bool,
+    "BUY_TAKE_MAX_PREMIUM": float,
     "FAIR_VALUE_OVERRIDE": str,
 }
 
@@ -105,7 +130,11 @@ def load_risk_config():
     global INVENTORY_SKEW, TORCH_WEIGHT, TORCH_MAX_ADJUST, POSITION_EDGE_STEP
     global MIN_REPRICE, STALE_EDGE_RATIO, MIN_PROFIT, EXIT_TAKE_PROFIT
     global STOP_LOSS, MIN_EQUITY_STOP, MAX_LOSS_STOP
-    global ALLOW_SHORT, ALLOW_BUY_TAKE, FAIR_VALUE_OVERRIDE
+    global MAX_SPREAD_ENTER, MAX_VOLATILITY_ENTER
+    global AGGRESSION_MODE, MOMENTUM_MODE, MOMENTUM_TREND_ENTER
+    global MOMENTUM_EDGE_DISCOUNT, MOMENTUM_PRICE_STEP, DOWNTREND_EDGE_EXTRA
+    global PAUSE_TRADING, STOP_BOT
+    global ALLOW_SHORT, ALLOW_BUY_TAKE, BUY_TAKE_MAX_PREMIUM, FAIR_VALUE_OVERRIDE
 
     try:
         stat = RISK_CONFIG_PATH.stat()
@@ -461,13 +490,13 @@ def replace_or_create(trading, existing, side, price, qty):
         order = preferred_order(existing, side)
         current_price = int(order["price"])
         remaining = int(order["remaining"])
-        if side == "buy" and price >= current_price:
-            return "keep"
-        if side == "sell" and price <= current_price:
-            return "keep"
         if abs(current_price - price) >= MIN_REPRICE:
             trading.replace_order(order["id"], price=price, qty=qty)
             return "replace"
+        if side == "buy" and current_price >= price:
+            return "keep"
+        if side == "sell" and current_price <= price:
+            return "keep"
         if remaining > qty:
             trading.replace_order(order["id"], qty=qty)
             return "resize"
@@ -514,6 +543,44 @@ def log_history(event, **payload):
         print("history log error:", exc)
 
 
+def momentum_flags():
+    up_votes = 0
+    down_votes = 0
+
+    if SIGNAL.trend >= MOMENTUM_TREND_ENTER:
+        up_votes += 1
+    elif SIGNAL.trend <= -MOMENTUM_TREND_ENTER:
+        down_votes += 1
+
+    if SIGNAL.book_imbalance >= 0.22:
+        up_votes += 1
+    elif SIGNAL.book_imbalance <= -0.22:
+        down_votes += 1
+
+    if SIGNAL.trade_flow >= 0.18:
+        up_votes += 1
+    elif SIGNAL.trade_flow <= -0.18:
+        down_votes += 1
+
+    return up_votes >= 2, down_votes >= 2
+
+
+def normalized_momentum_mode():
+    return str(MOMENTUM_MODE or "auto").strip().lower()
+
+
+def is_up_mode(mode):
+    return mode in ("alcista", "up", "bull", "sprint", "momentum_alcista")
+
+
+def is_down_mode(mode):
+    return mode in ("bajista", "down", "bear", "defensivo_bajista")
+
+
+def uses_momentum(mode):
+    return mode not in ("neutral", "off", "apagado")
+
+
 def strategy(md: MyMarketData, trading: MyTrading) -> None:
     load_risk_config()
     account = trading.account()
@@ -523,10 +590,13 @@ def strategy(md: MyMarketData, trading: MyTrading) -> None:
     ask = md.best_ask()
     mark = md.last_price
     fair_text = f"{fair:.1f}" if fair is not None else "None"
+    up_momentum, down_momentum = momentum_flags()
+    momentum_mode = normalized_momentum_mode()
 
     print(
         f"mark={mark} bid={bid} ask={ask} fair={fair_text} "
-        f"pos={position} pnl={account.get('pnl')} open={len(account['open_orders'])}"
+        f"pos={position} pnl={account.get('pnl')} open={len(account['open_orders'])} "
+        f"mom={momentum_mode} up={int(up_momentum)} down={int(down_momentum)}"
     )
     log_history(
         "snapshot",
@@ -545,12 +615,34 @@ def strategy(md: MyMarketData, trading: MyTrading) -> None:
         volatility=SIGNAL.volatility,
         book_imbalance=SIGNAL.book_imbalance,
         trade_flow=SIGNAL.trade_flow,
+        up_momentum=up_momentum,
+        down_momentum=down_momentum,
+        momentum_mode=momentum_mode,
+        aggression_mode=AGGRESSION_MODE,
     )
 
     if fair is None or bid is None or ask is None:
         return
     if account.get("busted"):
         raise RiskStop("Cuenta busted")
+
+    if STOP_BOT:
+        trading.cancel_all()
+        raise RiskStop("Detenido desde panel local")
+
+    if PAUSE_TRADING:
+        # Pausa local:
+        # - cancela ordenes abiertas para dejar de tomar riesgo;
+        # - conserva el proceso y WebSocket privado vivos;
+        # - sale antes de cualquier decision de estrategia.
+        # La siguiente IA debe mantener este bloque antes de stops/quotes para
+        # que el boton Pausar sea inmediato y no dependa de la logica quant.
+        if account["open_orders"]:
+            trading.cancel_all()
+            print(f"PAUSED: canceladas ordenes abiertas={len(account['open_orders'])}")
+        else:
+            print("PAUSED: conexion viva, sin ordenes nuevas")
+        return
 
     equity = float(account.get("equity") or 0.0)
     pnl = float(account.get("pnl") or 0.0)
@@ -585,8 +677,24 @@ def strategy(md: MyMarketData, trading: MyTrading) -> None:
 
         if avg_price and bid >= avg_price + EXIT_TAKE_PROFIT:
             qty = min(ORDER_QTY, position, int(md.status.get("max_order_qty", 50)))
+            trading.cancel_all()
             trading.new_order("sell", bid, qty)
             print(f"SELL REALIZE qty={qty} price={bid} avg={avg_price:.1f} profit={bid - avg_price:.1f}")
+            return
+
+        if (
+            avg_price
+            and uses_momentum(momentum_mode)
+            and (down_momentum or is_down_mode(momentum_mode))
+            and bid >= avg_price + MIN_PROFIT
+        ):
+            qty = min(ORDER_QTY, position, int(md.status.get("max_order_qty", 50)))
+            trading.cancel_all()
+            trading.new_order("sell", bid, qty)
+            print(
+                f"SELL MOMENTUM EXIT qty={qty} price={bid} "
+                f"avg={avg_price:.1f} profit={bid - avg_price:.1f}"
+            )
             return
 
         target_price = ask if ask >= min_exit_price else min_exit_price
@@ -605,15 +713,51 @@ def strategy(md: MyMarketData, trading: MyTrading) -> None:
             print(f"CANCEL SELL no-short={cancelled}")
             return
 
+    if position == 0 and uses_momentum(momentum_mode):
+        block_reason = None
+        if is_down_mode(momentum_mode):
+            block_reason = "modo bajista"
+        elif is_up_mode(momentum_mode) and not up_momentum:
+            block_reason = "esperando momentum alcista"
+        elif momentum_mode == "auto" and down_momentum:
+            block_reason = "momentum bajista"
+
+        if block_reason:
+            cancelled = cancel_side_orders(trading, account, "buy")
+            print(f"NO ENTRY {block_reason} cancelled_buys={cancelled}")
+            return
+
+    spread_now = ask - bid
+    if position == 0 and (
+        spread_now > MAX_SPREAD_ENTER or SIGNAL.volatility > MAX_VOLATILITY_ENTER
+    ):
+        cancelled = cancel_side_orders(trading, account, "buy")
+        reason = (
+            f"spread={spread_now}>{MAX_SPREAD_ENTER}"
+            if spread_now > MAX_SPREAD_ENTER
+            else f"vol={SIGNAL.volatility:.1f}>{MAX_VOLATILITY_ENTER:.1f}"
+        )
+        print(f"NO ENTRY {reason} cancelled_buys={cancelled}")
+        return
+
     if cancel_excess_orders(trading, account):
         return
 
-    spread = max(1, ask - bid)
+    spread = max(1, spread_now)
     risk_edge = VOL_EDGE_MULT * SIGNAL.volatility
-    quote_edge = MIN_EDGE + spread * 0.15 + risk_edge
+    momentum_discount = 0
+    if uses_momentum(momentum_mode) and up_momentum and (momentum_mode == "auto" or is_up_mode(momentum_mode)):
+        momentum_discount = MOMENTUM_EDGE_DISCOUNT
+    downtrend_extra = DOWNTREND_EDGE_EXTRA if uses_momentum(momentum_mode) and down_momentum else 0
+    quote_edge = max(10.0, MIN_EDGE - momentum_discount + downtrend_extra + spread * 0.15 + risk_edge)
     position_skew = position * INVENTORY_SKEW
+    buy_ceiling = bid - 1
+    if uses_momentum(momentum_mode) and up_momentum and (momentum_mode == "auto" or is_up_mode(momentum_mode)):
+        buy_ceiling = min(ask - 1, bid - 1 + MOMENTUM_PRICE_STEP)
+        if ALLOW_BUY_TAKE:
+            buy_ceiling = ask
     buy_price = clamp_to_price_band(
-        math.floor(min(bid - 1, fair - quote_edge - position_skew)),
+        math.floor(min(buy_ceiling, fair - quote_edge - position_skew)),
         mark,
     )
     sell_price = clamp_to_price_band(
@@ -656,11 +800,17 @@ def strategy(md: MyMarketData, trading: MyTrading) -> None:
     ):
         return
 
-    # En modo reparado no perseguimos precio con compras agresivas.
-    if ALLOW_BUY_TAKE and buy_capacity > 0 and fair - ask >= TAKE_PROFIT:
+    if ALLOW_BUY_TAKE and buy_capacity > 0 and ask - fair <= BUY_TAKE_MAX_PREMIUM:
+        cancelled = cancel_side_orders(trading, account, "buy")
+        if cancelled:
+            print(f"CANCEL BUY before take={cancelled}")
+            return
         qty = min(max_qty, buy_capacity)
         trading.new_order("buy", ask, qty)
-        print(f"BUY TAKE qty={qty} price={ask} edge={fair - ask:.1f}")
+        print(
+            f"BUY TAKE qty={qty} price={ask} "
+            f"premium={ask - fair:.1f}/{BUY_TAKE_MAX_PREMIUM:.1f}"
+        )
         return
 
     if sell_capacity > 0 and bid - fair >= TAKE_PROFIT:
