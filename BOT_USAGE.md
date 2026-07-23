@@ -14,6 +14,16 @@ Usa el Python del entorno virtual:
 .venv/bin/python zanni_quant_bot.py
 ```
 
+Panel local de riesgo:
+
+```bash
+.venv/bin/python risk_control_server.py
+```
+
+Abre `http://127.0.0.1:8765`. `Pausar bot` cancela ordenes abiertas, mantiene
+la conexion viva y evita ordenes nuevas; `Reanudar` vuelve a operar en el
+siguiente ciclo; `Detener bot` cancela ordenes y apaga el proceso del bot.
+
 Con credenciales manuales:
 
 ```bash
@@ -30,6 +40,15 @@ Si quieres forzar un valor justo propio:
 
 ```bash
 CIPC_FAIR_VALUE=12000 .venv/bin/python zanni_quant_bot.py
+```
+
+Tambien puedes pausar sin abrir el panel editando `risk_config.json`:
+
+```json
+{
+  "PAUSE_TRADING": true,
+  "STOP_BOT": false
+}
 ```
 
 ## Subir al challenge
