@@ -14,8 +14,8 @@ from cipc import CipcError, MarketDataConnection, TradingConnection
 # inyectando host/puerto/credenciales de tu instancia por variables de entorno.
 HOST = os.environ.get("CIPC_HOST", "outliers.progcomp.cl")
 PORT = int(os.environ.get("CIPC_PORT", "443"))
-USER = os.environ.get("CIPC_USER", "TU_USUARIO")
-PASSWORD = os.environ.get("CIPC_PASS", "TU_PASSWORD")
+USER = os.environ.get("CIPC_USER", "fpatatacolli")
+PASSWORD = os.environ.get("CIPC_PASS", "patata2008")
 
 
 class MyMarketData(MarketDataConnection):
